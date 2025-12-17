@@ -1,0 +1,11 @@
+{
+    "$schema": "https://opencode.ai/config.json",
+    "plugin": [
+        "file:///Users/darrenhinde/Documents/GitHub/test-larvel/my-little-plugin"
+      ],
+    "agent": {
+      "explore": {
+        "disable": true
+      }
+    }
+  }

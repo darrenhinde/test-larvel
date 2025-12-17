@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+bun.lockb
 
 # Build output
 dist/
@@ -19,14 +20,15 @@ dist/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
-Thumbs.db
 
 # TypeScript
 *.tsbuildinfo
 
-# Lock files (keep bun.lock)
-package-lock.json
-yarn.lock
+# Testing
+coverage/
+.nyc_output/
+
+# Temporary files
+*.tmp
+.cache/

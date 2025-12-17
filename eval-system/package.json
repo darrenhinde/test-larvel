@@ -1,0 +1,21 @@
+{
+  "name": "@eval-system/core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "test": "bun run examples/simple-test.ts",
+    "test:agent": "bun run examples/custom-agent-test.ts",
+    "test:existing": "bun run examples/existing-agent-test.ts",
+    "test:patterns": "bun run examples/pattern-tests.ts",
+    "test:temp": "bun run examples/temp-env-test.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "latest",
+    "@opencode-ai/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}

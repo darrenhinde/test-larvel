@@ -1,0 +1,658 @@
+Excellent question! The current setup **doesn't fully sandbox the file system**. Let me add proper sandboxing with temporary workspaces, cleanup, and isolation:
+
+## Enhanced Sandboxed Eval Runner
+
+```typescript
+// eval-sandboxed-runner.ts - Fully isolated sandbox for testing
+
+import { createOpencodeServer, createOpencodeClient } from "@opencode-ai/sdk";
+import path from "path";
+import { readFile, mkdir, rm, cp, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { randomBytes } from "crypto";
+
+/**
+ * Sandbox Configuration
+ */
+export type SandboxConfig = {
+  // Sandbox strategy
+  strategy?: "temp" | "copy" | "in-place";
+  
+  // For "copy" strategy: copy these files/dirs to sandbox
+  copyFrom?: string[];
+  
+  // Cleanup after test?
+  autoCleanup?: boolean;
+  
+  // Keep sandbox on failure for debugging?
+  keepOnFailure?: boolean;
+  
+  // Custom sandbox path (otherwise uses temp)
+  sandboxPath?: string;
+  
+  // Git isolation
+  isolateGit?: boolean;
+  
+  // Environment variables to set
+  env?: Record<string, string>;
+  
+  // Port for server
+  port?: number;
+  
+  // Agent files to load
+  agentFiles?: string[];
+  
+  // Eval plugins
+  evalPlugins?: string[];
+  
+  // OpenCode config
+  config?: any;
+};
+
+/**
+ * Sandboxed Eval Environment
+ */
+export class SandboxedEvalRunner {
+  private config: SandboxConfig;
+  private sandboxDir: string | null = null;
+  private server: Awaited<ReturnType<typeof createOpencodeServer>> | null = null;
+  private client: ReturnType<typeof createOpencodeClient> | null = null;
+  private originalCwd: string;
+  private originalEnv: NodeJS.ProcessEnv;
+
+  constructor(config: SandboxConfig = {}) {
+    this.config = {
+      strategy: config.strategy || "temp",
+      copyFrom: config.copyFrom || [],
+      autoCleanup: config.autoCleanup ?? true,
+      keepOnFailure: config.keepOnFailure ?? true,
+      isolateGit: config.isolateGit ?? true,
+      env: config.env || {},
+      port: config.port || 4097,
+      agentFiles: config.agentFiles || [],
+      evalPlugins: config.evalPlugins || [],
+      config: config.config || {},
+      sandboxPath: config.sandboxPath,
+    };
+    
+    this.originalCwd = process.cwd();
+    this.originalEnv = { ...process.env };
+  }
+
+  /**
+   * Create and setup sandbox
+   */
+  async createSandbox(): Promise<string> {
+    console.log("📦 Creating sandbox environment...");
+    
+    if (this.config.strategy === "temp") {
+      // Create temporary directory
+      const uniqueId = randomBytes(8).toString("hex");
+      this.sandboxDir = this.config.sandboxPath || 
+        path.join(tmpdir(), `opencode-eval-${uniqueId}`);
+      
+      await mkdir(this.sandboxDir, { recursive: true });
+      console.log(`   Created temp sandbox: ${this.sandboxDir}`);
+      
+      // Copy specified files/directories
+      if (this.config.copyFrom && this.config.copyFrom.length > 0) {
+        console.log(`   Copying ${this.config.copyFrom.length} items to sandbox...`);
+        
+        for (const item of this.config.copyFrom) {
+          const sourcePath = path.join(this.originalCwd, item);
+          const destPath = path.join(this.sandboxDir, item);
+          
+          try {
+            // Create parent directory
+            await mkdir(path.dirname(destPath), { recursive: true });
+            
+            // Copy recursively
+            await cp(sourcePath, destPath, { recursive: true });
+            console.log(`      ✓ ${item}`);
+          } catch (err) {
+            console.warn(`      ⚠️  Failed to copy ${item}: ${err}`);
+          }
+        }
+      }
+      
+      // Create package.json if not exists (for node_modules resolution)
+      const packageJsonPath = path.join(this.sandboxDir, "package.json");
+      try {
+        await readFile(packageJsonPath);
+      } catch {
+        await writeFile(
+          packageJsonPath,
+          JSON.stringify({ name: "eval-sandbox", version: "0.0.0" }, null, 2)
+        );
+      }
+      
+    } else if (this.config.strategy === "copy") {
+      // Copy entire directory
+      const uniqueId = randomBytes(8).toString("hex");
+      this.sandboxDir = this.config.sandboxPath ||
+        path.join(tmpdir(), `opencode-eval-${uniqueId}`);
+      
+      console.log(`   Copying workspace to: ${this.sandboxDir}`);
+      await cp(this.originalCwd, this.sandboxDir, { 
+        recursive: true,
+        // Exclude some directories
+        filter: (src) => {
+          const basename = path.basename(src);
+          return !["node_modules", ".git", "dist", "build", ".opencode-eval"].includes(basename);
+        },
+      });
+      
+    } else if (this.config.strategy === "in-place") {
+      // Use current directory but with isolated .opencode-eval
+      this.sandboxDir = this.originalCwd;
+      console.log(`   Using in-place sandbox (⚠️  will modify current directory)`);
+    }
+    
+    // Git isolation
+    if (this.config.isolateGit && this.sandboxDir !== this.originalCwd) {
+      const gitDir = path.join(this.sandboxDir, ".git");
+      try {
+        await rm(gitDir, { recursive: true, force: true });
+        console.log(`   🔒 Git isolated (removed .git)`);
+      } catch {
+        // No .git directory, that's fine
+      }
+      
+      // Initialize new git repo for clean state
+      await this.exec(`git init`, this.sandboxDir);
+      console.log(`   🔧 Initialized fresh git repo`);
+    }
+    
+    // Create eval output directory
+    const evalDir = path.join(this.sandboxDir, ".opencode-eval");
+    await mkdir(evalDir, { recursive: true });
+    
+    console.log(`✅ Sandbox ready: ${this.sandboxDir}`);
+    return this.sandboxDir;
+  }
+
+  /**
+   * Start sandboxed eval server
+   */
+  async start() {
+    // Create sandbox first
+    await this.createSandbox();
+    
+    console.log("🚀 Starting sandboxed eval server...");
+    
+    // Change to sandbox directory
+    process.chdir(this.sandboxDir!);
+    console.log(`   Working directory: ${this.sandboxDir}`);
+    
+    // Set environment variables
+    for (const [key, value] of Object.entries(this.config.env)) {
+      process.env[key] = value;
+      console.log(`   ENV: ${key}=${value}`);
+    }
+    
+    // Build config
+    const evalConfig = await this.buildEvalConfig();
+    
+    // Start server
+    this.server = await createOpencodeServer({
+      hostname: "127.0.0.1",
+      port: this.config.port,
+      config: evalConfig,
+    });
+    
+    this.client = createOpencodeClient({ 
+      baseUrl: this.server.url,
+      directory: this.sandboxDir,
+    });
+    
+    console.log(`✅ Sandboxed server running at ${this.server.url}`);
+    console.log(`   Port: ${this.config.port} (isolated from normal OpenCode)`);
+    
+    return { server: this.server, client: this.client, sandboxDir: this.sandboxDir! };
+  }
+
+  /**
+   * Stop server and cleanup sandbox
+   */
+  async stop(options?: { failed?: boolean }) {
+    console.log("\n🛑 Stopping sandboxed eval server...");
+    
+    // Close server
+    if (this.server) {
+      this.server.close();
+    }
+    
+    // Restore original directory
+    process.chdir(this.originalCwd);
+    
+    // Restore environment
+    process.env = this.originalEnv;
+    
+    // Cleanup sandbox
+    const shouldCleanup = this.config.autoCleanup && 
+      !(options?.failed && this.config.keepOnFailure);
+    
+    if (shouldCleanup && this.sandboxDir && this.sandboxDir !== this.originalCwd) {
+      try {
+        console.log(`🧹 Cleaning up sandbox: ${this.sandboxDir}`);
+        await rm(this.sandboxDir, { recursive: true, force: true });
+        console.log("✅ Sandbox cleaned up");
+      } catch (err) {
+        console.warn(`⚠️  Failed to cleanup sandbox: ${err}`);
+      }
+    } else if (this.sandboxDir) {
+      console.log(`📁 Sandbox preserved at: ${this.sandboxDir}`);
+      console.log(`   (Use for debugging, delete manually when done)`);
+    }
+  }
+
+  /**
+   * Get client for running tests
+   */
+  getClient() {
+    if (!this.client) {
+      throw new Error("Sandbox not started. Call start() first.");
+    }
+    return this.client;
+  }
+
+  /**
+   * Get sandbox directory
+   */
+  getSandboxDir() {
+    return this.sandboxDir;
+  }
+
+  /**
+   * Execute command in sandbox
+   */
+  private async exec(command: string, cwd: string): Promise<void> {
+    const proc = Bun.spawn(command.split(" "), { 
+      cwd,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await proc.exited;
+  }
+
+  /**
+   * Build eval config
+   */
+  private async buildEvalConfig(): Promise<any> {
+    let config: any = {
+      plugin: [],
+      agent: {},
+    };
+
+    // Load agents from .md files
+    if (this.config.agentFiles && this.config.agentFiles.length > 0) {
+      console.log(`   📝 Loading agents from ${this.config.agentFiles.length} files...`);
+      
+      for (const file of this.config.agentFiles) {
+        // Resolve path relative to original CWD
+        const filePath = path.join(this.originalCwd, file);
+        const agents = await this.parseAgentsFromMarkdown(filePath);
+        config.agent = { ...config.agent, ...agents };
+        console.log(`      Loaded: ${Object.keys(agents).join(", ")}`);
+      }
+    }
+
+    // Add eval plugins
+    if (this.config.evalPlugins && this.config.evalPlugins.length > 0) {
+      console.log(`   🔌 Loading ${this.config.evalPlugins.length} eval plugins...`);
+      
+      // Resolve plugin paths relative to original CWD
+      config.plugin = this.config.evalPlugins.map(plugin => {
+        if (plugin.startsWith("file://")) {
+          return plugin;
+        }
+        return "file://" + path.join(this.originalCwd, plugin);
+      });
+      
+      for (const plugin of config.plugin) {
+        console.log(`      ${path.basename(plugin.replace("file://", ""))}`);
+      }
+    }
+
+    // Apply config overrides
+    config = { ...config, ...this.config.config };
+
+    return config;
+  }
+
+  /**
+   * Parse agents from markdown
+   */
+  private async parseAgentsFromMarkdown(filePath: string): Promise<Record<string, any>> {
+    const content = await readFile(filePath, "utf-8");
+    const agents: Record<string, any> = {};
+    
+    const agentBlockRegex = /# (.+?)\n\n(?:(.+?)\n\n)?```agent\n([\s\S]+?)```/g;
+    
+    let match;
+    while ((match = agentBlockRegex.exec(content)) !== null) {
+      const name = match[1].trim();
+      const description = match[2]?.trim();
+      const configJson = match[3].trim();
+      
+      try {
+        const config = JSON.parse(configJson);
+        
+        agents[name.toLowerCase().replace(/\s+/g, "-")] = {
+          description: description || `Agent: ${name}`,
+          ...config,
+        };
+      } catch (err) {
+        console.warn(`   ⚠️  Failed to parse agent "${name}": ${err}`);
+      }
+    }
+    
+    return agents;
+  }
+}
+```
+
+## Usage Examples with Sandboxing
+
+### Example 1: Test Destructive Operations Safely
+
+```typescript
+// test-destructive-operations.ts
+
+import { SandboxedEvalRunner } from "./eval-sandboxed-runner";
+import { readdir } from "fs/promises";
+
+async function testDestructiveOperations() {
+  const runner = new SandboxedEvalRunner({
+    strategy: "copy", // Copy entire workspace
+    autoCleanup: true, // Clean up after test
+    keepOnFailure: true, // Keep sandbox if test fails
+    
+    evalPlugins: ["./observability-plugin.ts"],
+  });
+
+  await runner.start();
+  
+  try {
+    const client = runner.getClient();
+    const sandbox = runner.getSandboxDir();
+    
+    console.log(`\n🧪 Testing destructive operation in sandbox: ${sandbox}`);
+    
+    // Test: Delete all .test.ts files
+    const session = await client.session.create();
+    
+    await client.session.prompt({
+      path: { id: session.data.id },
+      body: {
+        parts: [{
+          type: "text",
+          text: "Delete all .test.ts files in the src directory",
+        }],
+      },
+    });
+    
+    // Wait for completion...
+    await waitForCompletion(client, session.data.id);
+    
+    // Verify files are deleted in sandbox
+    const files = await readdir(`${sandbox}/src`, { recursive: true });
+    const testFiles = files.filter((f: any) => f.endsWith(".test.ts"));
+    
+    console.log(`✅ Test completed - ${testFiles.length} test files remaining`);
+    console.log(`   (Your actual workspace is untouched!)`);
+    
+  } catch (err) {
+    console.error("❌ Test failed:", err);
+    await runner.stop({ failed: true }); // Keep sandbox for debugging
+    return;
+  }
+  
+  await runner.stop(); // Cleanup
+}
+
+testDestructiveOperations();
+```
+
+### Example 2: Test with Specific Files Only
+
+```typescript
+// test-with-specific-files.ts
+
+import { SandboxedEvalRunner } from "./eval-sandboxed-runner";
+
+async function testWithSpecificFiles() {
+  const runner = new SandboxedEvalRunner({
+    strategy: "temp", // Clean temp directory
+    
+    // Copy only what we need
+    copyFrom: [
+      "src/auth.ts",
+      "src/types.ts",
+      "package.json",
+      "tsconfig.json",
+    ],
+    
+    autoCleanup: true,
+    
+    evalPlugins: ["./observability-plugin.ts"],
+  });
+
+  await runner.start();
+  
+  try {
+    const client = runner.getClient();
+    
+    // Test: Refactor auth.ts
+    const session = await client.session.create();
+    
+    await client.session.prompt({
+      path: { id: session.data.id },
+      body: {
+        parts: [{
+          type: "text",
+          text: "Refactor src/auth.ts to use async/await",
+        }],
+      },
+    });
+    
+    // Agent will only see the files we copied
+    // Your full workspace is completely isolated
+    
+  } finally {
+    await runner.stop();
+  }
+}
+
+testWithSpecificFiles();
+```
+
+### Example 3: Test with Custom Environment
+
+```typescript
+// test-with-custom-env.ts
+
+import { SandboxedEvalRunner } from "./eval-sandboxed-runner";
+
+async function testWithCustomEnvironment() {
+  const runner = new SandboxedEvalRunner({
+    strategy: "copy",
+    
+    // Set environment variables for sandbox only
+    env: {
+      NODE_ENV: "test",
+      API_KEY: "test-key-12345",
+      DATABASE_URL: "sqlite::memory:",
+    },
+    
+    evalPlugins: ["./observability-plugin.ts"],
+  });
+
+  await runner.start();
+  
+  try {
+    const client = runner.getClient();
+    
+    // Test: Create API client with environment
+    const session = await client.session.create();
+    
+    await client.session.prompt({
+      path: { id: session.data.id },
+      body: {
+        parts: [{
+          type: "text",
+          text: "Create an API client that uses the API_KEY environment variable",
+        }],
+      },
+    });
+    
+    // Agent uses test environment
+    // Your actual environment is unchanged
+    
+  } finally {
+    await runner.stop();
+  }
+}
+
+testWithCustomEnvironment();
+```
+
+### Example 4: Run Multiple Tests in Parallel Sandboxes
+
+```typescript
+// parallel-sandboxed-tests.ts
+
+import { SandboxedEvalRunner } from "./eval-sandboxed-runner";
+
+async function runParallelTests() {
+  const tests = [
+    {
+      name: "Test Refactoring",
+      prompt: "Refactor all callbacks to async/await",
+      port: 4097,
+    },
+    {
+      name: "Test Bug Fixes",
+      prompt: "Fix all linter errors in src/",
+      port: 4098,
+    },
+    {
+      name: "Test Feature Addition",
+      prompt: "Add logging to all API endpoints",
+      port: 4099,
+    },
+  ];
+
+  // Run all tests in parallel, each in their own sandbox
+  await Promise.all(
+    tests.map(async (test) => {
+      const runner = new SandboxedEvalRunner({
+        strategy: "copy",
+        port: test.port, // Different port for each
+        autoCleanup: true,
+        evalPlugins: ["./observability-plugin.ts"],
+      });
+
+      await runner.start();
+      
+      try {
+        console.log(`\n🧪 ${test.name} (port ${test.port})`);
+        
+        const client = runner.getClient();
+        const session = await client.session.create();
+        
+        await client.session.prompt({
+          path: { id: session.data.id },
+          body: {
+            parts: [{ type: "text", text: test.prompt }],
+          },
+        });
+        
+        // ... wait and validate
+        
+        console.log(`✅ ${test.name} completed`);
+      } finally {
+        await runner.stop();
+      }
+    })
+  );
+  
+  console.log("\n✅ All parallel tests completed");
+}
+
+runParallelTests();
+```
+
+### Example 5: Integration Test Helper
+
+```typescript
+// eval-test-helper.ts
+
+import { SandboxedEvalRunner } from "./eval-sandboxed-runner";
+import { test, expect } from "bun:test";
+
+/**
+ * Helper to create sandboxed tests
+ */
+export function sandboxedTest(
+  name: string,
+  testFn: (client: any, sandbox: string) => Promise<void>
+) {
+  test(name, async () => {
+    const runner = new SandboxedEvalRunner({
+      strategy: "copy",
+      autoCleanup: true,
+      keepOnFailure: true,
+      evalPlugins: ["./observability-plugin.ts"],
+    });
+
+    await runner.start();
+    
+    try {
+      const client = runner.getClient();
+      const sandbox = runner.getSandboxDir()!;
+      
+      await testFn(client, sandbox);
+      
+      await runner.stop();
+    } catch (err) {
+      await runner.stop({ failed: true });
+      throw err;
+    }
+  });
+}
+
+// Usage:
+sandboxedTest("creates hello world file", async (client, sandbox) => {
+  const session = await client.session.create();
+  
+  await client.session.prompt({
+    path: { id: session.data.id },
+    body: {
+      parts: [{ type: "text", text: "Create hello.ts file" }],
+    },
+  });
+  
+  // Verify in sandbox
+  const file = await Bun.file(`${sandbox}/hello.ts`).text();
+  expect(file).toContain("function");
+});
+
+sandboxedTest("deletes test files safely", async (client, sandbox) => {
+  // Test destructive operation in isolated sandbox
+  // ...
+});
+```
+
+## Key Safety Features
+
+✅ **File System Isolation** - Temp directories or copies  
+✅ **Git Isolation** - Fresh git repo in sandbox  
+✅ **Environment Isolation** - Custom env vars per test  
+✅ **Process Isolation** - Separate server instance  
+✅ **Automatic Cleanup** - No leftover artifacts  
+✅ **Debug on Failure** - Keep sandbox when tests fail  
+✅ **Parallel Testing** - Multiple sandboxes simultaneously  
+✅ **Zero Impact** - Your workspace stays clean  
+
+Now you can safely test destructive operations, different configurations, and run parallel tests without any risk to your actual workspace!

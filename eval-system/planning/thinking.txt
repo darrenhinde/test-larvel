@@ -1,0 +1,1395 @@
+Yes! This is a **perfect use case for plugins**. You can build a monitoring/evaluation plugin that records everything the agent does. Let me show you how:
+
+[6 tools called]
+
+Perfect! You can absolutely build a monitoring/eval plugin. Looking at the plugin API, there are several hooks you can use to track everything:
+
+## Available Monitoring Hooks
+
+1. **`event`** - All OpenCode events (session created, etc.)
+2. **`chat.message`** - Every message sent by the user
+3. **`tool.execute.before`** - Before any tool runs
+4. **`tool.execute.after`** - After any tool runs (with results!)
+5. **`chat.params`** - LLM parameters being used
+6. **`experimental.chat.messages.transform`** - Full message context
+7. **`experimental.text.complete`** - Text completion events
+
+Let me create a complete **Eval/Monitoring Plugin** for you:
+
+```typescript
+import type { Plugin } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
+import path from "path";
+
+/**
+ * OpenCode Eval Plugin - Monitor and record all agent interactions
+ * 
+ * Records:
+ * - All user messages
+ * - All tool executions (inputs, outputs, timing)
+ * - All events
+ * - LLM parameters
+ * 
+ * Outputs to: .opencode-eval/<session-id>.jsonl
+ */
+const EvalPlugin: Plugin = async ({ client, directory, $ }) => {
+  // Create eval directory
+  const evalDir = path.join(directory, ".opencode-eval");
+  await $`mkdir -p ${evalDir}`.quiet();
+
+  // Helper to write JSONL logs
+  const logEvent = async (sessionID: string, event: any) => {
+    const logFile = path.join(evalDir, `${sessionID}.jsonl`);
+    const entry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...event,
+    });
+    await $`echo ${entry} >> ${logFile}`.quiet();
+  };
+
+  // Track tool execution timing
+  const toolTimings = new Map<string, number>();
+
+  return {
+    /**
+     * Monitor all events
+     */
+    event: async ({ event }) => {
+      if (event.type === "session.created") {
+        const sessionID = event.data.id;
+        await logEvent(sessionID, {
+          type: "session_started",
+          sessionID,
+          title: event.data.title,
+        });
+      }
+    },
+
+    /**
+     * Monitor user messages
+     */
+    "chat.message": async (input, output) => {
+      await logEvent(input.sessionID, {
+        type: "user_message",
+        sessionID: input.sessionID,
+        messageID: output.message.id,
+        agent: input.agent,
+        model: input.model,
+        parts: output.parts.map(p => ({
+          type: p.type,
+          text: p.type === "text" ? p.text : undefined,
+          tool: p.type === "tool" ? p.tool : undefined,
+        })),
+      });
+    },
+
+    /**
+     * Monitor LLM parameters
+     */
+    "chat.params": async (input, output) => {
+      await logEvent(input.sessionID, {
+        type: "llm_params",
+        sessionID: input.sessionID,
+        agent: input.agent,
+        model: {
+          providerID: input.model.providerID,
+          modelID: input.model.modelID,
+        },
+        params: {
+          temperature: output.temperature,
+          topP: output.topP,
+          topK: output.topK,
+        },
+      });
+    },
+
+    /**
+     * Monitor tool execution - BEFORE
+     */
+    "tool.execute.before": async (input, output) => {
+      // Record start time
+      toolTimings.set(input.callID, Date.now());
+
+      await logEvent(input.sessionID, {
+        type: "tool_started",
+        sessionID: input.sessionID,
+        callID: input.callID,
+        tool: input.tool,
+        args: output.args,
+        startTime: Date.now(),
+      });
+    },
+
+    /**
+     * Monitor tool execution - AFTER
+     */
+    "tool.execute.after": async (input, output) => {
+      const startTime = toolTimings.get(input.callID);
+      const duration = startTime ? Date.now() - startTime : 0;
+      toolTimings.delete(input.callID);
+
+      await logEvent(input.sessionID, {
+        type: "tool_completed",
+        sessionID: input.sessionID,
+        callID: input.callID,
+        tool: input.tool,
+        title: output.title,
+        output: output.output,
+        metadata: output.metadata,
+        duration,
+        endTime: Date.now(),
+      });
+    },
+
+    /**
+     * Custom tools for eval analysis
+     */
+    tool: {
+      eval_summary: tool({
+        description: "Generate a summary of the current eval session",
+        args: {
+          sessionID: tool.schema.string().optional().describe("Session ID to summarize (defaults to current)"),
+        },
+        async execute(args, context) {
+          const sessionID = args.sessionID || context.sessionID;
+          const logFile = path.join(evalDir, `${sessionID}.jsonl`);
+          
+          try {
+            const content = await $`cat ${logFile}`.text();
+            const events = content.trim().split('\n').map(line => JSON.parse(line));
+            
+            // Analyze the events
+            const toolCalls = events.filter(e => e.type === "tool_completed");
+            const messages = events.filter(e => e.type === "user_message");
+            
+            const summary = {
+              session: sessionID,
+              totalMessages: messages.length,
+              totalToolCalls: toolCalls.length,
+              tools: toolCalls.reduce((acc, t) => {
+                acc[t.tool] = (acc[t.tool] || 0) + 1;
+                return acc;
+              }, {} as Record<string, number>),
+              avgToolDuration: toolCalls.length > 0 
+                ? toolCalls.reduce((sum, t) => sum + (t.duration || 0), 0) / toolCalls.length 
+                : 0,
+              timeline: events.map(e => ({
+                time: e.timestamp,
+                type: e.type,
+                tool: e.tool,
+              })),
+            };
+            
+            return `# Eval Summary for ${sessionID}\n\n${JSON.stringify(summary, null, 2)}`;
+          } catch (err) {
+            return `Error: Could not find eval data for session ${sessionID}`;
+          }
+        },
+      }),
+
+      eval_export: tool({
+        description: "Export eval data for analysis",
+        args: {
+          sessionID: tool.schema.string().optional().describe("Session ID to export"),
+          format: tool.schema.string().optional().describe("Format: json or csv (default: json)"),
+        },
+        async execute(args, context) {
+          const sessionID = args.sessionID || context.sessionID;
+          const logFile = path.join(evalDir, `${sessionID}.jsonl`);
+          const format = args.format || "json";
+          
+          try {
+            const content = await $`cat ${logFile}`.text();
+            const events = content.trim().split('\n').map(line => JSON.parse(line));
+            
+            if (format === "csv") {
+              // Convert to CSV for spreadsheet analysis
+              const toolEvents = events.filter(e => e.type === "tool_completed");
+              const csv = [
+                "timestamp,tool,duration,success",
+                ...toolEvents.map(e => 
+                  `${e.timestamp},${e.tool},${e.duration || 0},${!e.error}`
+                )
+              ].join('\n');
+              
+              const csvFile = path.join(evalDir, `${sessionID}.csv`);
+              await Bun.write(csvFile, csv);
+              return `Exported to: ${csvFile}`;
+            }
+            
+            // JSON format
+            const jsonFile = path.join(evalDir, `${sessionID}.json`);
+            await Bun.write(jsonFile, JSON.stringify(events, null, 2));
+            return `Exported to: ${jsonFile}`;
+          } catch (err) {
+            return `Error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        },
+      }),
+
+      eval_verify: tool({
+        description: "Verify expected behavior in the eval session",
+        args: {
+          sessionID: tool.schema.string().optional().describe("Session ID to verify"),
+          expectations: tool.schema.object({
+            tools: tool.schema.array(tool.schema.string()).optional().describe("Expected tools to be called"),
+            minToolCalls: tool.schema.number().optional().describe("Minimum number of tool calls"),
+            maxDuration: tool.schema.number().optional().describe("Maximum duration in ms"),
+          }).describe("Verification expectations"),
+        },
+        async execute(args, context) {
+          const sessionID = args.sessionID || context.sessionID;
+          const logFile = path.join(evalDir, `${sessionID}.jsonl`);
+          
+          try {
+            const content = await $`cat ${logFile}`.text();
+            const events = content.trim().split('\n').map(line => JSON.parse(line));
+            const toolCalls = events.filter(e => e.type === "tool_completed");
+            
+            const results: string[] = [];
+            results.push("# Verification Results\n");
+            
+            // Check expected tools
+            if (args.expectations.tools) {
+              const calledTools = new Set(toolCalls.map(t => t.tool));
+              const missing = args.expectations.tools.filter(t => !calledTools.has(t));
+              
+              if (missing.length === 0) {
+                results.push("✅ All expected tools were called");
+              } else {
+                results.push(`❌ Missing tools: ${missing.join(', ')}`);
+              }
+            }
+            
+            // Check minimum tool calls
+            if (args.expectations.minToolCalls !== undefined) {
+              if (toolCalls.length >= args.expectations.minToolCalls) {
+                results.push(`✅ Tool calls: ${toolCalls.length} >= ${args.expectations.minToolCalls}`);
+              } else {
+                results.push(`❌ Too few tool calls: ${toolCalls.length} < ${args.expectations.minToolCalls}`);
+              }
+            }
+            
+            // Check max duration
+            if (args.expectations.maxDuration !== undefined) {
+              const slowTools = toolCalls.filter(t => (t.duration || 0) > args.expectations.maxDuration!);
+              
+              if (slowTools.length === 0) {
+                results.push(`✅ All tools completed within ${args.expectations.maxDuration}ms`);
+              } else {
+                results.push(`❌ Slow tools: ${slowTools.map(t => `${t.tool} (${t.duration}ms)`).join(', ')}`);
+              }
+            }
+            
+            return results.join('\n');
+          } catch (err) {
+            return `Error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        },
+      }),
+    },
+  };
+};
+
+export default EvalPlugin;
+```
+
+## How to Use This Eval Plugin
+
+### 1. Save it as a plugin
+
+```bash
+# Save as packages/plugin/src/eval-plugin.ts or in your project
+```
+
+### 2. Enable it in your OpenCode config
+
+```json
+{
+  "plugin": [
+    "./path/to/eval-plugin.ts"
+  ]
+}
+```
+
+### 3. Use it during development
+
+The plugin automatically records ALL interactions to `.opencode-eval/<session-id>.jsonl`
+
+### 4. Analyze results
+
+```bash
+# During or after a session, ask the agent:
+"Use eval_summary to show me what happened"
+
+# Export for analysis
+"Use eval_export with format csv"
+
+# Verify expected behavior
+"Use eval_verify with expectations: {tools: ['read', 'write'], minToolCalls: 3}"
+```
+
+## Example JSONL Output
+
+```jsonl
+{"timestamp":"2025-12-17T...","type":"session_started","sessionID":"abc123"}
+{"timestamp":"2025-12-17T...","type":"user_message","sessionID":"abc123","messageID":"msg1"}
+{"timestamp":"2025-12-17T...","type":"tool_started","tool":"read","args":{...}}
+{"timestamp":"2025-12-17T...","type":"tool_completed","tool":"read","duration":45,"output":"..."}
+```
+
+## Benefits for Eval System
+
+1. **Complete audit trail** - Every action is logged
+2. **Timing data** - Performance metrics for each tool
+3. **Structured data** - Easy to parse and analyze
+4. **Export options** - CSV for spreadsheets, JSON for scripts
+5. **Verification tools** - Built-in assertions for expected behavior
+6. **No code changes needed** - Just enable the plugin
+
+Want me to add more eval features like:
+- Diff comparison between expected and actual outputs?
+- Integration with testing frameworks?
+- Real-time monitoring dashboard?
+- Regression detection?
+
+
+Ah, you're right! You want an **automated eval/testing framework** where you write scripts that:
+
+1. Send specific prompts to the AI
+2. Monitor what it does
+3. Verify the results meet expectations
+4. Generate reports
+
+This is different from just monitoring interactive sessions. Let me look at the OpenCode SDK to see what's available for programmatic interaction:
+
+[6 tools called]
+
+Perfect! Now I see what you need. Let me create a **proper eval/testing framework** that you can use to write automated test scripts:
+
+```typescript
+// eval-runner.ts - Automated testing framework for OpenCode
+
+import { createOpencodeClient, createOpencodeServer, type Event } from "@opencode-ai/sdk";
+import { readdir, readFile, stat } from "fs/promises";
+import path from "path";
+
+/**
+ * Test Case Definition
+ */
+export type TestCase = {
+  name: string;
+  prompt: string;
+  files?: string[]; // Files to attach
+  expectations: {
+    toolsCalled?: string[]; // Tools that should be called
+    filesCreated?: string[]; // Files that should be created
+    filesModified?: string[]; // Files that should be modified
+    noErrors?: boolean; // Should complete without errors
+    outputContains?: string[]; // Output should contain these strings
+    maxDuration?: number; // Max duration in ms
+    custom?: (context: TestContext) => Promise<boolean | string>; // Custom validation
+  };
+};
+
+/**
+ * Test Context - passed to custom validators
+ */
+export type TestContext = {
+  sessionID: string;
+  events: Event[];
+  messages: any[];
+  toolCalls: Array<{ tool: string; args: any; output: any; duration: number }>;
+  directory: string;
+};
+
+/**
+ * Test Result
+ */
+export type TestResult = {
+  name: string;
+  passed: boolean;
+  duration: number;
+  errors: string[];
+  warnings: string[];
+  details: {
+    toolsCalled: string[];
+    filesChanged: string[];
+    messageCount: number;
+  };
+};
+
+/**
+ * Eval Runner - Runs automated tests against OpenCode
+ */
+export class EvalRunner {
+  private server: Awaited<ReturnType<typeof createOpencodeServer>>;
+  private client: ReturnType<typeof createOpencodeClient>;
+  private directory: string;
+
+  constructor(directory: string) {
+    this.directory = directory;
+  }
+
+  /**
+   * Start the OpenCode server
+   */
+  async start(config?: any) {
+    this.server = await createOpencodeServer({ config });
+    this.client = createOpencodeClient({ baseUrl: this.server.url });
+    console.log(`✅ Server started at ${this.server.url}`);
+  }
+
+  /**
+   * Stop the server
+   */
+  async stop() {
+    this.server?.close();
+  }
+
+  /**
+   * Run a single test case
+   */
+  async runTest(test: TestCase): Promise<TestResult> {
+    console.log(`\n🧪 Running test: ${test.name}`);
+    const startTime = Date.now();
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Create session
+    const session = await this.client.session.create();
+    const sessionID = session.data.id;
+
+    // Track events
+    const events: Event[] = [];
+    const toolCalls: TestContext["toolCalls"] = [];
+    const messages: any[] = [];
+
+    // Subscribe to events
+    const eventStream = await this.client.event.subscribe();
+    const eventPromise = this.monitorEvents(sessionID, eventStream, events, toolCalls, messages);
+
+    // Send prompt
+    const parts: any[] = [];
+    
+    // Attach files if specified
+    if (test.files) {
+      for (const file of test.files) {
+        parts.push({
+          type: "file",
+          mime: "text/plain",
+          url: `file://${path.join(this.directory, file)}`,
+        });
+      }
+    }
+
+    parts.push({
+      type: "text",
+      text: test.prompt,
+    });
+
+    await this.client.session.prompt({
+      path: { id: sessionID },
+      body: { parts },
+    });
+
+    // Wait for session to complete
+    await this.waitForCompletion(sessionID, events, test.expectations.maxDuration);
+
+    // Stop monitoring
+    eventStream.controller.abort();
+    await eventPromise.catch(() => {});
+
+    const duration = Date.now() - startTime;
+
+    // Build context for validation
+    const context: TestContext = {
+      sessionID,
+      events,
+      messages,
+      toolCalls,
+      directory: this.directory,
+    };
+
+    // Validate expectations
+    if (test.expectations.toolsCalled) {
+      const actualTools = toolCalls.map(t => t.tool);
+      const missingTools = test.expectations.toolsCalled.filter(t => !actualTools.includes(t));
+      if (missingTools.length > 0) {
+        errors.push(`Missing expected tools: ${missingTools.join(", ")}`);
+      }
+    }
+
+    if (test.expectations.filesCreated) {
+      for (const file of test.expectations.filesCreated) {
+        const exists = await this.fileExists(path.join(this.directory, file));
+        if (!exists) {
+          errors.push(`Expected file not created: ${file}`);
+        }
+      }
+    }
+
+    if (test.expectations.filesModified) {
+      const editedFiles = events
+        .filter(e => e.payload.type === "file.edited")
+        .map((e: any) => e.payload.properties.path);
+      
+      for (const file of test.expectations.filesModified) {
+        if (!editedFiles.includes(file)) {
+          errors.push(`Expected file not modified: ${file}`);
+        }
+      }
+    }
+
+    if (test.expectations.noErrors) {
+      const errorEvents = events.filter(e => e.payload.type === "session.error");
+      if (errorEvents.length > 0) {
+        errors.push(`Session had ${errorEvents.length} error(s)`);
+      }
+    }
+
+    if (test.expectations.outputContains) {
+      const allText = messages
+        .flatMap(m => m.parts || [])
+        .filter(p => p.type === "text")
+        .map(p => p.text)
+        .join("\n");
+
+      for (const needle of test.expectations.outputContains) {
+        if (!allText.includes(needle)) {
+          errors.push(`Output missing expected text: "${needle}"`);
+        }
+      }
+    }
+
+    if (test.expectations.maxDuration && duration > test.expectations.maxDuration) {
+      warnings.push(`Duration ${duration}ms exceeded max ${test.expectations.maxDuration}ms`);
+    }
+
+    // Run custom validator
+    if (test.expectations.custom) {
+      const result = await test.expectations.custom(context);
+      if (result !== true) {
+        errors.push(typeof result === "string" ? result : "Custom validation failed");
+      }
+    }
+
+    const passed = errors.length === 0;
+    const icon = passed ? "✅" : "❌";
+    console.log(`${icon} ${test.name} - ${duration}ms`);
+    if (errors.length > 0) {
+      errors.forEach(e => console.log(`  ❌ ${e}`));
+    }
+    if (warnings.length > 0) {
+      warnings.forEach(w => console.log(`  ⚠️  ${w}`));
+    }
+
+    return {
+      name: test.name,
+      passed,
+      duration,
+      errors,
+      warnings,
+      details: {
+        toolsCalled: toolCalls.map(t => t.tool),
+        filesChanged: events
+          .filter(e => e.payload.type === "file.edited")
+          .map((e: any) => e.payload.properties.path),
+        messageCount: messages.length,
+      },
+    };
+  }
+
+  /**
+   * Run multiple test cases
+   */
+  async runTests(tests: TestCase[]): Promise<TestResult[]> {
+    const results: TestResult[] = [];
+
+    for (const test of tests) {
+      const result = await this.runTest(test);
+      results.push(result);
+    }
+
+    // Print summary
+    this.printSummary(results);
+
+    return results;
+  }
+
+  /**
+   * Monitor events for a session
+   */
+  private async monitorEvents(
+    sessionID: string,
+    stream: any,
+    events: Event[],
+    toolCalls: TestContext["toolCalls"],
+    messages: any[]
+  ) {
+    const toolTimings = new Map<string, number>();
+
+    try {
+      for await (const event of stream.body) {
+        if (event.directory !== this.directory) continue;
+        events.push(event);
+
+        const payload = event.payload;
+
+        // Track tool executions
+        if (payload.type === "message.part.updated") {
+          const part = payload.properties.part;
+          if (part.type === "tool") {
+            if (part.state.status === "pending") {
+              toolTimings.set(part.callID, Date.now());
+            } else if (part.state.status === "completed") {
+              const startTime = toolTimings.get(part.callID) || Date.now();
+              toolCalls.push({
+                tool: part.tool,
+                args: part.state.input,
+                output: part.state.output,
+                duration: Date.now() - startTime,
+              });
+            }
+          }
+        }
+
+        // Track messages
+        if (payload.type === "message.updated") {
+          messages.push(payload.properties.message);
+        }
+      }
+    } catch (err) {
+      // Stream aborted, that's ok
+    }
+  }
+
+  /**
+   * Wait for session to complete
+   */
+  private async waitForCompletion(
+    sessionID: string,
+    events: Event[],
+    maxDuration?: number
+  ): Promise<void> {
+    const startTime = Date.now();
+    const timeout = maxDuration || 60000; // Default 60s
+
+    while (Date.now() - startTime < timeout) {
+      // Check if session is idle
+      const idleEvent = events.find(
+        e => e.payload.type === "session.idle" && (e.payload as any).properties?.sessionID === sessionID
+      );
+      
+      if (idleEvent) {
+        return;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    throw new Error(`Timeout waiting for session to complete after ${timeout}ms`);
+  }
+
+  /**
+   * Check if file exists
+   */
+  private async fileExists(filePath: string): Promise<boolean> {
+    try {
+      await stat(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Print summary of test results
+   */
+  private printSummary(results: TestResult[]) {
+    console.log("\n" + "=".repeat(60));
+    console.log("📊 Test Summary");
+    console.log("=".repeat(60));
+
+    const passed = results.filter(r => r.passed).length;
+    const failed = results.filter(r => !r.passed).length;
+    const total = results.length;
+    const totalDuration = results.reduce((sum, r) => sum + r.duration, 0);
+
+    console.log(`\n✅ Passed: ${passed}/${total}`);
+    console.log(`❌ Failed: ${failed}/${total}`);
+    console.log(`⏱️  Total Duration: ${totalDuration}ms`);
+
+    if (failed > 0) {
+      console.log("\n❌ Failed Tests:");
+      results.filter(r => !r.passed).forEach(r => {
+        console.log(`  • ${r.name}`);
+        r.errors.forEach(e => console.log(`    - ${e}`));
+      });
+    }
+
+    console.log("\n" + "=".repeat(60));
+  }
+
+  /**
+   * Export results to JSON
+   */
+  async exportResults(results: TestResult[], outputPath: string) {
+    const report = {
+      timestamp: new Date().toISOString(),
+      summary: {
+        total: results.length,
+        passed: results.filter(r => r.passed).length,
+        failed: results.filter(r => !r.passed).length,
+      },
+      results,
+    };
+
+    await Bun.write(outputPath, JSON.stringify(report, null, 2));
+    console.log(`📝 Results exported to ${outputPath}`);
+  }
+}
+```
+
+## Example Usage
+
+```typescript
+// my-eval-tests.ts - Your test suite
+
+import { EvalRunner, type TestCase } from "./eval-runner";
+
+const tests: TestCase[] = [
+  {
+    name: "Create a hello world function",
+    prompt: "Create a TypeScript file called hello.ts with a function that returns 'Hello World'",
+    expectations: {
+      toolsCalled: ["write"],
+      filesCreated: ["hello.ts"],
+      noErrors: true,
+      outputContains: ["hello.ts"],
+    },
+  },
+
+  {
+    name: "Fix linter errors",
+    files: ["buggy-file.ts"],
+    prompt: "Fix all the linter errors in this file",
+    expectations: {
+      toolsCalled: ["read", "edit"],
+      filesModified: ["buggy-file.ts"],
+      noErrors: true,
+      custom: async (context) => {
+        // Custom validation: check if linter errors are gone
+        const errors = context.events.filter(
+          e => e.payload.type === "lsp.client.diagnostics"
+        );
+        return errors.length === 0 || "Linter errors still present";
+      },
+    },
+  },
+
+  {
+    name: "Implement a feature with tests",
+    prompt: "Create a sum function in math.ts and write tests for it in math.test.ts",
+    expectations: {
+      filesCreated: ["math.ts", "math.test.ts"],
+      toolsCalled: ["write"],
+      maxDuration: 30000,
+      custom: async (context) => {
+        // Verify test file actually has test cases
+        const testFile = await Bun.file("math.test.ts").text();
+        return testFile.includes("test(") || testFile.includes("it(")
+          ? true
+          : "Test file doesn't contain actual tests";
+      },
+    },
+  },
+];
+
+// Run the tests
+const runner = new EvalRunner(process.cwd());
+
+await runner.start({
+  // Optional config
+  agent: { build: { model: "anthropic/claude-sonnet-4" } },
+});
+
+try {
+  const results = await runner.runTests(tests);
+  await runner.exportResults(results, "./eval-results.json");
+  
+  // Exit with error code if any tests failed
+  const failed = results.filter(r => !r.passed).length;
+  process.exit(failed > 0 ? 1 : 0);
+} finally {
+  await runner.stop();
+}
+```
+
+## Usage
+
+```bash
+# Run your eval suite
+bun run my-eval-tests.ts
+
+# Output:
+# ✅ Server started at http://127.0.0.1:4096
+# 🧪 Running test: Create a hello world function
+# ✅ Create a hello world function - 1234ms
+# 🧪 Running test: Fix linter errors
+# ✅ Fix linter errors - 2341ms
+# 📊 Test Summary
+# ✅ Passed: 2/2
+# 📝 Results exported to ./eval-results.json
+```
+
+This gives you:
+- ✅ Programmatic control
+- ✅ Automated test execution  
+- ✅ Custom validators
+- ✅ Event monitoring
+- ✅ CI/CD integration
+- ✅ Regression testing
+
+Want me to add more features like:
+- Parallel test execution?
+- Snapshot testing?
+- Performance benchmarking?
+- HTML report generation?
+
+
+Excellent question! Yes, you can **enable plugins when running SDK-based evals** by passing plugin configuration to the server. Let me show you how to create a reusable logging/observability plugin and use it in your eval scripts:
+
+[2 tools called]
+
+Perfect! I can see that plugins are loaded from the `config.plugin` array. Here's how to create a **reusable observability plugin** with OpenTelemetry support and use it in your eval scripts:
+
+## 1. Create the Observability Plugin
+
+```typescript
+// observability-plugin.ts - Reusable logging & tracing plugin
+
+import type { Plugin } from "@opencode-ai/plugin";
+import { trace, context, SpanStatusCode, type Span } from "@opentelemetry/api";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { Resource } from "@opentelemetry/resources";
+import { SemanticResourceAttributes } from "@opentelemetry/semantic-conventions";
+
+/**
+ * Observability Plugin Configuration
+ */
+export type ObservabilityConfig = {
+  // OpenTelemetry endpoint (e.g., Jaeger, Honeycomb, etc.)
+  otlpEndpoint?: string;
+  
+  // Service name for tracing
+  serviceName?: string;
+  
+  // Log output file
+  logFile?: string;
+  
+  // Enable/disable different features
+  tracing?: boolean;
+  logging?: boolean;
+  metrics?: boolean;
+  
+  // Custom attributes to add to all spans
+  attributes?: Record<string, string>;
+};
+
+/**
+ * Observability Plugin - OpenTelemetry + Structured Logging
+ */
+export function createObservabilityPlugin(config: ObservabilityConfig = {}): Plugin {
+  return async ({ client, directory, $ }) => {
+    const cfg = {
+      serviceName: config.serviceName || "opencode-eval",
+      otlpEndpoint: config.otlpEndpoint || process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+      logFile: config.logFile || ".opencode-observability.jsonl",
+      tracing: config.tracing ?? !!config.otlpEndpoint,
+      logging: config.logging ?? true,
+      metrics: config.metrics ?? false,
+      attributes: config.attributes || {},
+    };
+
+    let provider: NodeTracerProvider | undefined;
+    let tracer: ReturnType<typeof trace.getTracer> | undefined;
+
+    // Initialize OpenTelemetry if enabled
+    if (cfg.tracing && cfg.otlpEndpoint) {
+      provider = new NodeTracerProvider({
+        resource: new Resource({
+          [SemanticResourceAttributes.SERVICE_NAME]: cfg.serviceName,
+          ...cfg.attributes,
+        }),
+      });
+
+      const exporter = new OTLPTraceExporter({
+        url: cfg.otlpEndpoint,
+      });
+
+      provider.addSpanProcessor(new BatchSpanProcessor(exporter));
+      provider.register();
+      
+      tracer = trace.getTracer(cfg.serviceName);
+      console.log(`✅ OpenTelemetry tracing enabled: ${cfg.otlpEndpoint}`);
+    }
+
+    // Logging helper
+    const log = async (event: any) => {
+      if (!cfg.logging) return;
+      
+      const entry = {
+        timestamp: new Date().toISOString(),
+        ...event,
+      };
+
+      // Write to log file
+      const logPath = `${directory}/${cfg.logFile}`;
+      await $`echo ${JSON.stringify(entry)} >> ${logPath}`.quiet();
+    };
+
+    // Active spans map (callID -> span)
+    const activeSpans = new Map<string, Span>();
+    const sessionSpans = new Map<string, Span>();
+
+    return {
+      /**
+       * Track session lifecycle
+       */
+      event: async ({ event }) => {
+        if (event.type === "session.created") {
+          const sessionID = event.data.id;
+          
+          await log({
+            type: "session.started",
+            sessionID,
+            title: event.data.title,
+            agent: event.data.agent,
+          });
+
+          // Create session span
+          if (tracer) {
+            const span = tracer.startSpan("session", {
+              attributes: {
+                "session.id": sessionID,
+                "session.title": event.data.title,
+                "session.agent": event.data.agent,
+              },
+            });
+            sessionSpans.set(sessionID, span);
+          }
+        }
+
+        if (event.type === "session.updated") {
+          const sessionID = event.data.id;
+          
+          // End session span if completed
+          if (event.data.time?.completed) {
+            const span = sessionSpans.get(sessionID);
+            if (span) {
+              span.setStatus({ code: SpanStatusCode.OK });
+              span.end();
+              sessionSpans.delete(sessionID);
+            }
+
+            await log({
+              type: "session.completed",
+              sessionID,
+              duration: event.data.time.completed - event.data.time.created,
+            });
+          }
+        }
+
+        if (event.type === "session.error") {
+          const sessionID = (event as any).properties?.sessionID;
+          
+          await log({
+            type: "session.error",
+            sessionID,
+            error: (event as any).properties?.error,
+          });
+
+          // Mark session span as error
+          const span = sessionSpans.get(sessionID);
+          if (span) {
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: (event as any).properties?.error?.message,
+            });
+            span.end();
+            sessionSpans.delete(sessionID);
+          }
+        }
+      },
+
+      /**
+       * Track user messages
+       */
+      "chat.message": async (input, output) => {
+        await log({
+          type: "user.message",
+          sessionID: input.sessionID,
+          messageID: output.message.id,
+          agent: input.agent,
+          model: input.model,
+          partsCount: output.parts.length,
+        });
+
+        // Create message span
+        if (tracer) {
+          const parentSpan = sessionSpans.get(input.sessionID);
+          const ctx = parentSpan ? trace.setSpan(context.active(), parentSpan) : undefined;
+          
+          const span = tracer.startSpan(
+            "chat.message",
+            {
+              attributes: {
+                "message.id": output.message.id,
+                "message.agent": input.agent || "unknown",
+                "message.parts": output.parts.length,
+              },
+            },
+            ctx
+          );
+          
+          // Store for completion tracking
+          activeSpans.set(output.message.id, span);
+        }
+      },
+
+      /**
+       * Track LLM parameters
+       */
+      "chat.params": async (input, output) => {
+        await log({
+          type: "llm.params",
+          sessionID: input.sessionID,
+          model: {
+            providerID: input.model.providerID,
+            modelID: input.model.modelID,
+          },
+          params: {
+            temperature: output.temperature,
+            topP: output.topP,
+            topK: output.topK,
+          },
+        });
+
+        // Add params to active message span
+        const span = activeSpans.get(input.message.id);
+        if (span) {
+          span.setAttributes({
+            "llm.provider": input.model.providerID,
+            "llm.model": input.model.modelID,
+            "llm.temperature": output.temperature,
+          });
+        }
+      },
+
+      /**
+       * Track tool execution - BEFORE
+       */
+      "tool.execute.before": async (input, output) => {
+        const startTime = Date.now();
+
+        await log({
+          type: "tool.started",
+          sessionID: input.sessionID,
+          callID: input.callID,
+          tool: input.tool,
+          args: output.args,
+          timestamp: startTime,
+        });
+
+        // Create tool span
+        if (tracer) {
+          const sessionSpan = sessionSpans.get(input.sessionID);
+          const ctx = sessionSpan ? trace.setSpan(context.active(), sessionSpan) : undefined;
+          
+          const span = tracer.startSpan(
+            `tool.${input.tool}`,
+            {
+              attributes: {
+                "tool.name": input.tool,
+                "tool.call_id": input.callID,
+                "tool.session_id": input.sessionID,
+                ...Object.entries(output.args).reduce((acc, [k, v]) => {
+                  acc[`tool.arg.${k}`] = String(v);
+                  return acc;
+                }, {} as Record<string, string>),
+              },
+            },
+            ctx
+          );
+          
+          activeSpans.set(input.callID, span);
+        }
+      },
+
+      /**
+       * Track tool execution - AFTER
+       */
+      "tool.execute.after": async (input, output) => {
+        const endTime = Date.now();
+
+        await log({
+          type: "tool.completed",
+          sessionID: input.sessionID,
+          callID: input.callID,
+          tool: input.tool,
+          title: output.title,
+          outputLength: output.output?.length || 0,
+          timestamp: endTime,
+        });
+
+        // Complete tool span
+        const span = activeSpans.get(input.callID);
+        if (span) {
+          span.setAttributes({
+            "tool.output_length": output.output?.length || 0,
+            "tool.title": output.title,
+          });
+          span.setStatus({ code: SpanStatusCode.OK });
+          span.end();
+          activeSpans.delete(input.callID);
+        }
+      },
+    };
+  };
+}
+
+export default createObservabilityPlugin;
+```
+
+## 2. Use in Eval Scripts
+
+```typescript
+// eval-with-observability.ts
+
+import { createOpencodeClient, createOpencodeServer } from "@opencode-ai/sdk";
+import { createObservabilityPlugin } from "./observability-plugin";
+
+/**
+ * Eval runner with observability
+ */
+async function runEval() {
+  // Create config with observability plugin
+  const config = {
+    // Your OpenCode config
+    agent: {
+      build: {
+        model: "anthropic/claude-sonnet-4",
+      },
+    },
+    
+    // Enable the observability plugin
+    plugin: [
+      // Can pass inline plugin with config
+      "file://" + new URL("./observability-plugin.ts", import.meta.url).pathname,
+    ],
+  };
+
+  // Start server with plugin enabled
+  const server = await createOpencodeServer({ config });
+  const client = createOpencodeClient({ baseUrl: server.url });
+
+  console.log("✅ Server started with observability plugin");
+
+  try {
+    // Run your test
+    const session = await client.session.create();
+    
+    await client.session.prompt({
+      path: { id: session.data.id },
+      body: {
+        parts: [
+          {
+            type: "text",
+            text: "Create a hello.ts file with a hello world function",
+          },
+        ],
+      },
+    });
+
+    // Wait for completion
+    await waitForIdle(client, session.data.id);
+
+    console.log("✅ Test completed - check .opencode-observability.jsonl for logs");
+
+  } finally {
+    server.close();
+  }
+}
+
+async function waitForIdle(client: any, sessionID: string, timeout = 30000) {
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < timeout) {
+    const session = await client.session.get({ path: { id: sessionID } });
+    
+    if (session.data.time?.completed) {
+      return;
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  
+  throw new Error("Timeout waiting for session to complete");
+}
+
+runEval();
+```
+
+## 3. Conditional Observability (Environment-Based)
+
+```typescript
+// eval-runner-conditional.ts
+
+import { createOpencodeServer } from "@opencode-ai/sdk";
+
+// Enable observability only when ENABLE_TRACING is set
+const enableObservability = process.env.ENABLE_TRACING === "true";
+
+const config: any = {
+  agent: { build: { model: "anthropic/claude-sonnet-4" } },
+};
+
+if (enableObservability) {
+  config.plugin = [
+    "file://" + new URL("./observability-plugin.ts", import.meta.url).pathname,
+  ];
+  console.log("📊 Observability enabled");
+}
+
+const server = await createOpencodeServer({ config });
+
+// Usage:
+// ENABLE_TRACING=true bun run eval-runner-conditional.ts
+```
+
+## 4. Advanced: Programmatic Plugin Creation
+
+```typescript
+// eval-with-inline-plugin.ts
+
+import { createOpencodeServer } from "@opencode-ai/sdk";
+import type { Plugin } from "@opencode-ai/plugin";
+import fs from "fs/promises";
+
+// Create plugin programmatically
+const createCustomLogger = (outputFile: string): Plugin => {
+  return async ({ directory, $ }) => {
+    return {
+      "tool.execute.after": async (input, output) => {
+        const logEntry = {
+          timestamp: new Date().toISOString(),
+          tool: input.tool,
+          sessionID: input.sessionID,
+          duration: output.metadata?.duration,
+        };
+        
+        await fs.appendFile(
+          `${directory}/${outputFile}`,
+          JSON.stringify(logEntry) + "\n"
+        );
+      },
+    };
+  };
+};
+
+// Write plugin to temp file
+const pluginCode = `
+import type { Plugin } from "@opencode-ai/plugin";
+export default ${createCustomLogger.toString()}("eval-${Date.now()}.jsonl");
+`;
+
+const pluginPath = `/tmp/custom-logger-${Date.now()}.ts`;
+await fs.writeFile(pluginPath, pluginCode);
+
+// Use it
+const server = await createOpencodeServer({
+  config: {
+    plugin: [`file://${pluginPath}`],
+  },
+});
+```
+
+## 5. Integration with Testing Frameworks
+
+```typescript
+// eval-suite-with-observability.ts
+
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { createOpencodeServer, createOpencodeClient } from "@opencode-ai/sdk";
+
+let server: Awaited<ReturnType<typeof createOpencodeServer>>;
+let client: ReturnType<typeof createOpencodeClient>;
+
+beforeAll(async () => {
+  server = await createOpencodeServer({
+    config: {
+      plugin: [
+        // Observability plugin for all tests
+        "file://" + new URL("./observability-plugin.ts", import.meta.url).pathname,
+      ],
+    },
+  });
+  
+  client = createOpencodeClient({ baseUrl: server.url });
+});
+
+afterAll(() => {
+  server.close();
+});
+
+test("create hello world file", async () => {
+  const session = await client.session.create();
+  
+  await client.session.prompt({
+    path: { id: session.data.id },
+    body: {
+      parts: [{
+        type: "text",
+        text: "Create hello.ts with a hello function",
+      }],
+    },
+  });
+  
+  // Assertions...
+  // Logs automatically captured in .opencode-observability.jsonl
+});
+```
+
+## Benefits
+
+✅ **Conditional enabling** - Only enable observability when needed  
+✅ **OpenTelemetry support** - Send traces to Jaeger, Honeycomb, etc.  
+✅ **Structured logging** - JSONL format for easy parsing  
+✅ **Programmatic control** - Create plugins dynamically  
+✅ **CI/CD friendly** - Environment variable control  
+✅ **No code changes** - Just pass plugin in config
+
+## Example: View Traces in Jaeger
+
+```bash
+# Start Jaeger locally
+docker run -d --name jaeger \
+  -p 16686:16686 \
+  -p 4318:4318 \
+  jaegertracing/all-in-one:latest
+
+# Run evals with tracing
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces \
+  bun run eval-with-observability.ts
+
+# View traces at http://localhost:16686
+```
+
+Want me to add features like:
+- Metrics collection (tool execution counts, latencies)?
+- Integration with Prometheus/Grafana?
+- Real-time dashboard during evals?
+- Span context propagation for distributed tracing?
