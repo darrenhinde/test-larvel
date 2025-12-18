@@ -1,0 +1,32 @@
+{
+  "name": "openagents",
+  "version": "0.1.0",
+  "description": "Open repository for building and sharing agents for OpenCode",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm",
+    "dev": "bun run --watch src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.0.162",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.14",
+    "typescript": "^5.8.3"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.0.0"
+  },
+  "keywords": [
+    "opencode",
+    "agents",
+    "ai",
+    "plugin"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,35 @@
+{
+  "$schema": "./schema.json",
+  "enabled": true,
+  "add_prefix": true,
+  "primary_prefix": "(Open)",
+  "subagent_prefix": "(OpenSub)",
+  "default_visible_to": ["plan", "build"],
+  "show_version_popup": true,
+  "agents_dir": "./agents",
+  "default_model": "opencode/big-pickle",
+  "context_dir": "./.openagents/context",
+  "agents": {
+    "researcher": {
+      "enabled": true,
+      "mode": "subagent",
+      "parallel": true,
+      "temperature": 0.7
+    },
+    "coder": {
+      "enabled": true,
+      "mode": "subagent",
+      "parallel": false,
+      "temperature": 0.2
+    },
+    "reviewer": {
+      "enabled": true,
+      "mode": "subagent",
+      "parallel": false,
+      "tools": {
+        "write": false,
+        "edit": false
+      }
+    }
+  }
+}

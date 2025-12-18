@@ -1,0 +1,181 @@
+{
+  "$schema": "./schema.json",
+  
+  // ============================================
+  // IMPORTANT: Plugin is OPT-IN by default
+  // ============================================
+  // Set to true to enable the plugin
+  "enabled": true,
+  
+  // ============================================
+  // PREFIX SETTINGS
+  // ============================================
+  
+  // Add prefixes to agent names
+  "add_prefix": true,
+  
+  // Prefix for PRIMARY agents (mode: "primary")
+  // Example: "(Open) Plan", "(Open) Build"
+  "primary_prefix": "(Open)",
+  
+  // Prefix for SUBAGENTS (mode: "subagent")
+  // Example: "(OpenSub) researcher", "(OpenSub) coder"
+  "subagent_prefix": "(OpenSub)",
+  
+  // ============================================
+  // VISIBILITY SETTINGS
+  // ============================================
+  
+  // Default visibility: which agents can see OpenAgents subagents
+  // Default: ["plan", "build"] - only plan and build agents
+  // Use ["*"] to make visible to all agents
+  "default_visible_to": ["plan", "build"],
+  
+  // ============================================
+  // DISPLAY SETTINGS
+  // ============================================
+  
+  // Show version popup when session starts
+  "show_version_popup": true,
+  
+  // ============================================
+  // AGENT CONFIGURATION
+  // ============================================
+  
+  // Directory containing agent .md files
+  "agents_dir": "./agents",
+  
+  // Default model for all agents
+  "default_model": "opencode/big-pickle",
+  
+  // Directory for context files
+  "context_dir": "./.openagents/context",
+  
+  // ============================================
+  // PER-AGENT SETTINGS
+  // ============================================
+  
+  "agents": {
+    // ========================================
+    // EXAMPLE: Primary Agent
+    // ========================================
+    "custom-plan": {
+      "enabled": true,
+      
+      // Set mode to "primary" for primary agents
+      "mode": "primary",
+      
+      // This will show as: "(Open) custom-plan"
+      
+      // Model configuration
+      "model": "opencode/big-pickle",
+      "temperature": 0.5,
+      
+      // Primary agents don't need visible_to
+      // (they're the ones that invoke subagents)
+      
+      // Optional: Custom prefix (overrides primary_prefix)
+      // "prefix": "(MyCustom)"
+    },
+    
+    // ========================================
+    // EXAMPLE: Research Subagent
+    // ========================================
+    "researcher": {
+      "enabled": true,
+      
+      // Set mode to "subagent" for subagents (default)
+      "mode": "subagent",
+      
+      // This will show as: "(OpenSub) researcher"
+      
+      // Use faster model for research
+      "model": "opencode/grok-fast",
+      
+      // Allow parallel execution
+      "parallel": true,
+      "parallel_limit": 10,
+      
+      // Higher temperature for creative research
+      "temperature": 0.7,
+      
+      // Visibility: which agents can use this subagent
+      // If not specified, uses default_visible_to
+      // ["*"] = all agents
+      // ["plan", "build"] = only plan and build
+      // ["plan"] = only plan
+      "visible_to": ["plan", "build", "research"],
+      
+      // Optional: Custom prefix (overrides subagent_prefix)
+      // "prefix": "(Research)"
+    },
+    
+    // ========================================
+    // EXAMPLE: Code Subagent
+    // ========================================
+    "coder": {
+      "enabled": true,
+      "mode": "subagent",
+      
+      // This will show as: "(OpenSub) coder"
+      
+      // Use more capable model for coding
+      "model": "opencode/big-pickle",
+      
+      // Sequential execution (not parallel)
+      "parallel": false,
+      
+      // Lower temperature for precise code
+      "temperature": 0.2,
+      
+      // Only visible to specific agents
+      "visible_to": ["plan", "build", "dev"]
+    },
+    
+    // ========================================
+    // EXAMPLE: Review Subagent
+    // ========================================
+    "reviewer": {
+      "enabled": true,
+      "mode": "subagent",
+      
+      // This will show as: "(OpenSub) reviewer"
+      
+      // Disable write/edit tools for safety
+      "tools": {
+        "write": false,
+        "edit": false,
+        "bash": false
+      },
+      
+      // Only visible to build agent
+      "visible_to": ["build"],
+      
+      // Optional: Custom prefix for review agents
+      // "prefix": "(Review)"
+    },
+    
+    // ========================================
+    // EXAMPLE: Custom Prefix
+    // ========================================
+    "analyzer": {
+      "enabled": true,
+      "mode": "subagent",
+      
+      // Custom prefix overrides subagent_prefix
+      "prefix": "(Analyze)",
+      
+      // This will show as: "(Analyze) analyzer"
+      
+      "temperature": 0.4,
+      "visible_to": ["plan", "research"]
+    }
+  },
+  
+  // ============================================
+  // DISABLED AGENTS
+  // ============================================
+  
+  // List of agent names to disable completely
+  "disabled_agents": []
+}
