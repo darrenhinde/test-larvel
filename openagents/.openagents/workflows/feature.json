@@ -1,0 +1,31 @@
+{
+  "id": "feature-workflow",
+  "description": "Plan → Build → Test a feature",
+  "max_iterations": 10,
+  "max_duration_ms": 600000,
+  "steps": [
+    {
+      "id": "plan",
+      "type": "agent",
+      "agent": "plan",
+      "next": "build",
+      "timeout_ms": 120000
+    },
+    {
+      "id": "build",
+      "type": "agent",
+      "agent": "build",
+      "input": "plan",
+      "next": "test",
+      "timeout_ms": 300000,
+      "max_retries": 2
+    },
+    {
+      "id": "test",
+      "type": "agent",
+      "agent": "test",
+      "input": "build",
+      "timeout_ms": 180000
+    }
+  ]
+}

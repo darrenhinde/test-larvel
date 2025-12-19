@@ -1,0 +1,49 @@
+{
+  "id": "refactor-workflow",
+  "description": "Full refactoring workflow with error handling",
+  "max_iterations": 15,
+  "max_duration_ms": 900000,
+  "steps": [
+    {
+      "id": "analyze",
+      "type": "agent",
+      "agent": "plan",
+      "next": "refactor",
+      "on_error": "error_handler",
+      "timeout_ms": 120000
+    },
+    {
+      "id": "refactor",
+      "type": "agent",
+      "agent": "build",
+      "input": "analyze",
+      "next": "test",
+      "on_error": "error_handler",
+      "timeout_ms": 300000,
+      "max_retries": 2
+    },
+    {
+      "id": "test",
+      "type": "agent",
+      "agent": "test",
+      "input": "refactor",
+      "next": "review",
+      "on_error": "error_handler",
+      "timeout_ms": 180000
+    },
+    {
+      "id": "review",
+      "type": "agent",
+      "agent": "review",
+      "input": "test",
+      "on_error": "error_handler",
+      "timeout_ms": 120000
+    },
+    {
+      "id": "error_handler",
+      "type": "agent",
+      "agent": "plan",
+      "timeout_ms": 60000
+    }
+  ]
+}

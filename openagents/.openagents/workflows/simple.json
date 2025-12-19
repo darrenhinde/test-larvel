@@ -1,0 +1,14 @@
+{
+  "id": "simple-workflow",
+  "description": "Simple single-step workflow for testing",
+  "max_iterations": 3,
+  "max_duration_ms": 120000,
+  "steps": [
+    {
+      "id": "plan",
+      "type": "agent",
+      "agent": "plan",
+      "timeout_ms": 60000
+    }
+  ]
+}

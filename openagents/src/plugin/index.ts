@@ -6,11 +6,19 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { join } from "node:path"
+import { readFileSync } from "node:fs"
 import { loadAgents, type AgentDefinition, type OpenCodeAgentConfig } from "../agents"
 import { loadConfig, type OpenAgentsConfig, type AgentConfig } from "./config"
 import { createTaskTracker } from "../features/task-tracker"
 import { createContextManager } from "../features/context"
 import { createUIManager } from "../features/ui"
+
+// Workflow imports
+import { WorkflowExecutor, MaxErrorGuard, CircularDependencyGuard } from "../workflow/executor"
+import { AgentStepExecutor, TransformStepExecutor, ConditionStepExecutor } from "../workflow/executors/agent"
+import { AgentResolver } from "../workflow/agent-resolver"
+import { OpenCodeAgentExecutor } from "../workflow/opencode-agent-executor"
+import type { WorkflowDefinition } from "../workflow/types"
 
 const PLUGIN_NAME = "OpenAgents"
 const PLUGIN_VERSION = "0.1.0"
@@ -118,6 +126,38 @@ const OpenAgentsPlugin: Plugin = async (ctx) => {
   const agentNames = [...agentMap.keys()]
   console.log(`[${PLUGIN_NAME}] Loaded ${agentMap.size} agents: ${agentNames.join(", ")}`)
   
+  // ============================================================================
+  // Workflow Setup
+  // ============================================================================
+  
+  // Create agent resolver (client is already properly typed from PluginInput)
+  const resolver = new AgentResolver(agentMap, client)
+  
+  // Register OpenCode built-in agents
+  const builtInAgents = ["plan", "build", "test", "review"]
+  resolver.registerOpenCodeAgents(builtInAgents)
+  
+  console.log(`[${PLUGIN_NAME}] Agent resolver created with ${resolver.listAgentNames().length} total agents`)
+  
+  // Create agent executor
+  const agentExecutor = new OpenCodeAgentExecutor(client, resolver)
+  
+  // Create workflow executor
+  const workflowExecutor = new WorkflowExecutor({
+    uiManager,
+    guards: [
+      new MaxErrorGuard(10),
+      new CircularDependencyGuard()
+    ]
+  })
+  
+  // Register step executors
+  workflowExecutor.registerExecutor("agent", new AgentStepExecutor(agentExecutor))
+  workflowExecutor.registerExecutor("transform", new TransformStepExecutor())
+  workflowExecutor.registerExecutor("condition", new ConditionStepExecutor())
+  
+  console.log(`[${PLUGIN_NAME}] Workflow executor initialized`)
+  
   return {
     /**
      * Register agents with OpenCode
@@ -159,6 +199,16 @@ const OpenAgentsPlugin: Plugin = async (ctx) => {
       } as typeof openCodeConfig.agent
       
       console.log(`[${PLUGIN_NAME}] Registered agents: ${Object.keys(agents).join(", ")}`)
+      
+      // ========================================================================
+      // Register workflow command
+      // ========================================================================
+      
+      // Note: Commands in OpenCode use a different structure
+      // For now, we'll skip command registration and use the workflow executor directly
+      // This can be enhanced later when command registration API is clarified
+      
+      console.log(`[${PLUGIN_NAME}] Workflow executor ready (use programmatically)`)
     },
     
     /**
@@ -207,9 +257,9 @@ const OpenAgentsPlugin: Plugin = async (ctx) => {
             : "⚠️ No agents found"
           
           try {
-            const tuiClient = client as any
-            if (tuiClient.tui?.showToast) {
-              await tuiClient.tui.showToast({
+            // Type-safe check for TUI availability
+            if (client.tui && typeof client.tui.showToast === 'function') {
+              await client.tui.showToast({
                 body: {
                   title: `${PLUGIN_NAME} v${PLUGIN_VERSION}`,
                   message,
@@ -252,5 +302,3 @@ const OpenAgentsPlugin: Plugin = async (ctx) => {
 console.log(`✅ ${PLUGIN_NAME} v${PLUGIN_VERSION} loaded`)
 
 export default OpenAgentsPlugin
-export { loadConfig, OpenAgentsConfigSchema } from "./config"
-export type { OpenAgentsConfig, AgentConfig } from "./config"

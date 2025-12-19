@@ -1,13 +1,26 @@
 {
   "name": "openagents",
   "version": "0.1.0",
-  "description": "Open repository for building and sharing agents for OpenCode",
+  "description": "OpenCode plugin for custom AI agents and workflows",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "dist/index.d.ts",
+  "main": "dist/plugin.js",
+  "types": "dist/plugin.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/plugin.js",
+      "require": "./dist/plugin.js",
+      "types": "./dist/plugin.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm",
-    "dev": "bun run --watch src/index.ts",
+    "build": "bun build src/plugin/index.ts --outfile dist/plugin.js --target bun --format esm",
+    "clean": "rm -rf dist",
+    "dev": "bun run --watch src/plugin/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
